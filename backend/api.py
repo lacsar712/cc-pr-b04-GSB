@@ -35,6 +35,22 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS filter_schemes (
+    id serial PRIMARY KEY,
+    name text NOT NULL,
+    prefix text NOT NULL DEFAULT '',
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS filter_scheme_history (
+    id serial PRIMARY KEY,
+    action text NOT NULL,
+    scheme_id integer,
+    scheme_name text NOT NULL,
+    prefix text NOT NULL DEFAULT '',
+    actor text NOT NULL,
+    created_at timestamptz NOT NULL
+);
 """
 
 
@@ -47,6 +63,11 @@ class JobIn(BaseModel):
     sheet: str
     cyan_mm: float
     magenta_mm: float
+
+
+class SchemeIn(BaseModel):
+    name: str
+    prefix: str = ""
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -103,10 +124,15 @@ def login(body: LoginIn):
 
 
 @app.get("/api/jobs")
-def list_jobs(_user: dict = Depends(current_user)):
+def list_jobs(prefix: str = "", _user: dict = Depends(current_user)):
+    # 过滤在服务端做：strpos(sheet, prefix) = 1 即“以前缀开头”，空前缀恒真返回全部
     with connect() as conn:
         return conn.execute(
-            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            """SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by
+               FROM jobs
+               WHERE strpos(sheet, %s) = 1
+               ORDER BY id DESC""",
+            (prefix,),
         ).fetchall()
 
 
@@ -121,3 +147,64 @@ def enqueue(body: JobIn, user: dict = Depends(require_writer)):
         ).fetchone()
         conn.commit()
     return row
+
+
+def write_history(conn, action: str, scheme_id: int, name: str, prefix: str, actor: str):
+    conn.execute(
+        """INSERT INTO filter_scheme_history (action, scheme_id, scheme_name, prefix, actor, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (action, scheme_id, name, prefix, actor, datetime.now(timezone.utc)),
+    )
+
+
+@app.get("/api/filter/schemes")
+def list_schemes(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT id, name, prefix, created_by, created_at FROM filter_schemes ORDER BY id"
+        ).fetchall()
+
+
+@app.post("/api/filter/schemes", status_code=201)
+def create_scheme(body: SchemeIn, user: dict = Depends(current_user)):
+    name = body.name.strip()
+    prefix = body.prefix.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="方案名不能为空")
+    with connect() as conn:
+        row = conn.execute(
+            """INSERT INTO filter_schemes (name, prefix, created_by, created_at)
+               VALUES (%s, %s, %s, %s)
+               RETURNING id, name, prefix, created_by, created_at""",
+            (name, prefix, user["username"], datetime.now(timezone.utc)),
+        ).fetchone()
+        write_history(conn, "create", row["id"], name, prefix, user["username"])
+        conn.commit()
+    return row
+
+
+@app.delete("/api/filter/schemes/{scheme_id}")
+def delete_scheme(scheme_id: int, user: dict = Depends(current_user)):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, name, prefix, created_by FROM filter_schemes WHERE id = %s",
+            (scheme_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="方案不存在")
+        if user["role"] != "writer" and row["created_by"] != user["username"]:
+            raise HTTPException(status_code=403, detail="只读账号不能删别人的方案")
+        conn.execute("DELETE FROM filter_schemes WHERE id = %s", (scheme_id,))
+        write_history(conn, "delete", row["id"], row["name"], row["prefix"], user["username"])
+        conn.commit()
+    return {"ok": True, "deleted": row["name"]}
+
+
+@app.get("/api/filter/history")
+def list_history(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            """SELECT id, action, scheme_id, scheme_name, prefix, actor, created_at
+               FROM filter_scheme_history
+               ORDER BY id DESC"""
+        ).fetchall()
