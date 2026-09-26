@@ -35,6 +35,22 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS filter_schemes (
+    id serial PRIMARY KEY,
+    name text NOT NULL UNIQUE,
+    prefix text NOT NULL DEFAULT '',
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL
+);
+CREATE TABLE IF NOT EXISTS filter_scheme_events (
+    id serial PRIMARY KEY,
+    scheme_id integer,
+    scheme_name text NOT NULL,
+    prefix text NOT NULL,
+    action text NOT NULL,
+    actor text NOT NULL,
+    created_at timestamptz NOT NULL
+);
 """
 
 
@@ -47,6 +63,11 @@ class JobIn(BaseModel):
     sheet: str
     cyan_mm: float
     magenta_mm: float
+
+
+class SchemeIn(BaseModel):
+    name: str
+    prefix: str = ""
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -103,10 +124,13 @@ def login(body: LoginIn):
 
 
 @app.get("/api/jobs")
-def list_jobs(_user: dict = Depends(current_user)):
+def list_jobs(prefix: str = "", _user: dict = Depends(current_user)):
+    # 前缀过滤在服务端做：starts_with(sheet, '') 恒真，空前缀即返回全部
     with connect() as conn:
         return conn.execute(
-            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            """SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by
+               FROM jobs WHERE starts_with(sheet, %s) ORDER BY id DESC""",
+            (prefix.strip(),),
         ).fetchall()
 
 
@@ -121,3 +145,66 @@ def enqueue(body: JobIn, user: dict = Depends(require_writer)):
         ).fetchone()
         conn.commit()
     return row
+
+
+def record_event(conn, scheme_id, name, prefix, action, actor):
+    conn.execute(
+        """INSERT INTO filter_scheme_events (scheme_id, scheme_name, prefix, action, actor, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (scheme_id, name, prefix, action, actor, datetime.now(timezone.utc)),
+    )
+
+
+@app.get("/api/filter/schemes")
+def list_schemes(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT id, name, prefix, created_by, created_at FROM filter_schemes ORDER BY id"
+        ).fetchall()
+
+
+@app.post("/api/filter/schemes", status_code=201)
+def create_scheme(body: SchemeIn, user: dict = Depends(current_user)):
+    # 印刷员与质检都可保存方案
+    name = body.name.strip()
+    prefix = body.prefix.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="方案名不能为空")
+    with connect() as conn:
+        if conn.execute("SELECT 1 FROM filter_schemes WHERE name = %s", (name,)).fetchone():
+            raise HTTPException(status_code=409, detail="方案名已存在")
+        row = conn.execute(
+            """INSERT INTO filter_schemes (name, prefix, created_by, created_at)
+               VALUES (%s, %s, %s, %s)
+               RETURNING id, name, prefix, created_by, created_at""",
+            (name, prefix, user["username"], datetime.now(timezone.utc)),
+        ).fetchone()
+        record_event(conn, row["id"], name, prefix, "create", user["username"])
+        conn.commit()
+    return row
+
+
+@app.delete("/api/filter/schemes/{scheme_id}")
+def delete_scheme(scheme_id: int, user: dict = Depends(current_user)):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, name, prefix, created_by FROM filter_schemes WHERE id = %s", (scheme_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="方案不存在")
+        # 只读账号不能删别人的方案；统一只允许创建者本人删除
+        if row["created_by"] != user["username"]:
+            raise HTTPException(status_code=403, detail="只能删除自己保存的方案")
+        conn.execute("DELETE FROM filter_schemes WHERE id = %s", (scheme_id,))
+        record_event(conn, row["id"], row["name"], row["prefix"], "delete", user["username"])
+        conn.commit()
+    return {"deleted": scheme_id}
+
+
+@app.get("/api/filter/events")
+def list_filter_events(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            """SELECT id, scheme_id, scheme_name, prefix, action, actor, created_at
+               FROM filter_scheme_events ORDER BY id DESC LIMIT 100"""
+        ).fetchall()
